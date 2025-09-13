@@ -1,0 +1,170 @@
+import os
+import json
+from telebot import types
+from datetime import datetime
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+from dotenv import load_dotenv
+load_dotenv() 
+import telebot
+# --- CONFIGURAÇÕES GERAIS ---
+CHAVE_API = os.environ.get("TELEGRAM_API_KEY") 
+bot = telebot.TeleBot(CHAVE_API)
+
+# --- CONFIGURAÇÃO GOOGLE SHEETS ---
+# Define o escopo de acesso (APIs que vamos usar)
+try:
+    # Constrói o caminho absoluto para o arquivo credentials.json
+    CREDS_JSON_STRING = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+    CREDS_DICT = json.loads(CREDS_JSON_STRING)
+    # Define o escopo de acesso (APIs que vamos usar)
+    SCOPE = ["https://spreadsheets.google.com/feeds", 'https://www.googleapis.com/auth/spreadsheets',
+             "https://www.googleapis.com/auth/drive.file", "https://www.googleapis.com/auth/drive"]
+
+    # Carrega as credenciais do arquivo JSON usando o caminho absoluto
+    CREDS = ServiceAccountCredentials.from_json_keyfile_dict(CREDS_DICT,SCOPE)
+    
+    # Autoriza o cliente
+    CLIENT = gspread.authorize(CREDS)
+    
+    # Abre a planilha pelo NOME.
+    SHEET = CLIENT.open("Teste Planilha Financeira").sheet1
+    print("Conectado à planilha com sucesso!")
+    # A linha abaixo pode dar erro se CAMINHO_CREDENCIAIS não for definido, então vamos tratar isso
+except NameError:
+    print("Não foi possível determinar o caminho de busca do script.")
+    SHEET = None
+except Exception as e:
+    print(f"Erro ao conectar com a planilha: {e}")
+    SHEET = None
+
+
+# --- DICIONÁRIOS E LISTAS ---
+gasto_atual = {}
+CATEGORIAS = [
+    "assinaturas", "combustivel", "cuidado_pessoal", "farmacia", "lazer",
+    "mercado", "reserva_da_casa", "suplementacao", "uber",
+    "valordisponivel_ISA", "valordisponivel_VICTOR"
+]
+
+# --- FUNÇÃO GLOBAL PARA ENVIAR DADOS ---
+def enviar_para_planilha(dados):
+    if SHEET is None:
+        print("Não foi possível enviar dados. Conexão com a planilha falhou.")
+        return False
+    try:
+        linha = [dados['Categoria'], dados['Valor'], dados['Data'], dados['Cartão']]
+        SHEET.append_row(linha)
+        print("Dados enviados para a planilha com sucesso!")
+        return True
+    except Exception as e:
+        print(f"Erro ao enviar para a planilha: {e}")
+        return False
+
+# --- FLUXO DO BOT ---
+
+@bot.message_handler(commands=['lancargasto'])
+def lancar_gasto(mensagem):
+    texto = """
+Maravilha, em qual das categorias abaixo se encaixa esse gasto?
+(Clique ou digite o comando)
+/assinaturas
+/combustivel
+/cuidado_pessoal
+/farmacia
+/lazer
+/mercado
+/reserva_da_casa
+/suplementacao
+/uber
+/valordisponivel_ISA
+/valordisponivel_VICTOR
+    """
+    bot.send_message(mensagem.chat.id, texto)
+
+@bot.message_handler(func=lambda msg: msg.text.replace('/', '') in CATEGORIAS)
+def registrar_categoria(mensagem):
+    categoria = mensagem.text.replace('/', '')
+    chat_id = mensagem.chat.id
+    gasto_atual[chat_id] = {'Categoria': categoria}
+    msg = bot.send_message(chat_id, f"Ok, categoria '{categoria}'. Qual o valor do gasto? (Ex: 15,50)")
+    bot.register_next_step_handler(msg, processar_valor)
+
+def processar_valor(mensagem):
+    chat_id = mensagem.chat.id
+    try:
+        valor = float(mensagem.text.replace(',', '.'))
+        gasto_atual[chat_id]['Valor'] = valor
+        msg = bot.send_message(chat_id, "Valor registrado. Qual a data do gasto? (dd/mm/aaaa ou 'hoje')")
+        bot.register_next_step_handler(msg, processar_data)
+    except ValueError:
+        msg = bot.send_message(chat_id, "Valor inválido. Por favor, envie apenas o número (ex: 25.99).")
+        bot.register_next_step_handler(msg, processar_valor)
+
+def processar_data(mensagem):
+    chat_id = mensagem.chat.id
+    data_texto = mensagem.text.lower()
+    
+    if data_texto == 'hoje':
+        data_gasto = datetime.now().strftime('%d/%m/%Y')
+    else:
+        try:
+            datetime.strptime(data_texto, '%d/%m/%Y')
+            data_gasto = data_texto
+        except ValueError:
+            msg = bot.send_message(chat_id, "Formato de data inválido. Use dd/mm/aaaa ou digite 'hoje'.")
+            bot.register_next_step_handler(msg, processar_data)
+            return
+
+    gasto_atual[chat_id]['Data'] = data_gasto
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    cartoes = ["Amex", "Nubank", "C6 Victor", "C6 Isa", "Inter"]
+    botoes = [types.InlineKeyboardButton(cartao, callback_data=cartao) for cartao in cartoes]
+    markup.add(*botoes)
+    bot.send_message(chat_id, "Data registrada. Agora, selecione o cartão utilizado:", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: True)
+def callback_cartao(callback):
+    chat_id = callback.message.chat.id
+    cartao_selecionado = callback.data
+    gasto_atual[chat_id]['Cartão'] = cartao_selecionado
+    dados_finais = gasto_atual.pop(chat_id)
+    
+    bot.edit_message_text(f"Cartão selecionado: {cartao_selecionado}", chat_id, callback.message.message_id)
+    
+    confirmacao = f"""
+Gasto registrado com sucesso!
+-----------------------------
+Categoria: {dados_finais['Categoria']}
+Valor: R$ {dados_finais['Valor']:.2f}
+Data: {dados_finais['Data']}
+Cartão: {dados_finais['Cartão']}
+    """
+    bot.send_message(chat_id, confirmacao)
+    
+    # AGORA SIM, CHAMANDO A FUNÇÃO GLOBAL!
+    if not enviar_para_planilha(dados_finais):
+        bot.send_message(chat_id, "Ops! Houve um problema ao salvar na planilha. Verifique o console do programa.")
+
+# --- Funções Adicionais e de Ajuda ---
+
+@bot.message_handler(commands=["s2"])
+def s2(mensagem):
+    bot.reply_to(mensagem, "Eu também te amo muito meu amor ❤️")
+
+@bot.message_handler(func=lambda message: True)
+def responder_padrao(mensagem):
+    texto = """
+Olá! Vamos atualizar a vida financeira?
+Selecione uma opção para continuarmos:
+
+/lancargasto -> Lançar um novo gasto
+/s2 -> Mandar um eu te amo
+
+Qualquer outra coisa não irá funcionar.
+CLIQUE em uma das opções.
+    """
+    bot.reply_to(mensagem, texto)
+
+print("Bot iniciado...")
+bot.polling()
