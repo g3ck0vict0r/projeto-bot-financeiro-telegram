@@ -1,0 +1,12 @@
+from selenium import webdriver
+from webdriver_manager.firefox import GeckoDriverManager
+from selenium.webdriver.firefox.service import Service
+
+servico = Service(GeckoDriverManager().install())
+
+navegador = webdriver.Firefox(service=servico)
+
+navegador.get("https://dlp.hashtagtreinamentos.com/python/minicurso/minicurso-automacao/inscricao?curso=python")
+navegador.find_element('xpath','//*[@id="firstname"]').send_keys("GeckoVict0r")
+navegador.find_element('xpath','//*[@id="email"]').send_keys("victorcarajelescow@gmail.com")
+navegador.find_element('xpath','//*[@id="_form_1925_submit"]').click()

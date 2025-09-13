@@ -1,0 +1,246 @@
+import os
+import json
+from telebot import types
+from datetime import datetime
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+from dotenv import load_dotenv
+load_dotenv() 
+import telebot
+import traceback
+
+# --- CONFIGURAÇÕES GERAIS ---
+CHAVE_API = os.environ.get("TELEGRAM_API_KEY") 
+bot = telebot.TeleBot(CHAVE_API)
+
+# --- CONFIGURAÇÃO GOOGLE SHEETS ---
+# Define o escopo de acesso (APIs utilizadas)
+try:
+    SCOPE = ["https://spreadsheets.google.com/feeds", 'https://www.googleapis.com/auth/spreadsheets',
+             "https://www.googleapis.com/auth/drive.file", "https://www.googleapis.com/auth/drive"]
+
+    # Esta é a linha que lê o arquivo "credentials.json" diretamente
+    CREDS = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", SCOPE)
+    
+    # Autoriza e abre a planilha
+    CLIENT = gspread.authorize(CREDS)
+    SHEET = CLIENT.open("Teste Planilha Financeira").sheet1
+    print("Conectado à planilha com sucesso!")
+
+except FileNotFoundError:
+    print("ERRO DE CONEXÃO: Não encontrei o arquivo 'credentials.json'. Ele está na mesma pasta do script?")
+    SHEET = None
+except Exception as e:
+    print(f"ERRO DE CONEXÃO: {e}")
+    SHEET = None
+
+
+# --- DICIONÁRIOS E LISTAS ---
+gasto_atual = {}
+CATEGORIAS = [
+    "assinaturas", "combustivel", "cuidado_pessoal", "farmacia", "lazer",
+    "mercado", "reserva_da_casa", "suplementacao", "uber",
+    "valordisponivel_ISA", "valordisponivel_VICTOR"
+]
+
+# --- FUNÇÃO GLOBAL PARA ENVIAR DADOS ---
+def enviar_para_planilha(dados):
+    if SHEET is None:
+        print("Não foi possível enviar dados. Conexão com a planilha falhou.")
+        return False
+    try:
+        mes = str(int(dados['Data'].split('/')[1]))
+        linha = [
+            mes,
+            dados['Categoria'], 
+            dados['Valor'], 
+            dados['Data'], 
+            dados['Descricao'], 
+            dados['Cartão']
+            ]
+        SHEET.append_row(linha)
+        print("Dados enviados para a planilha com sucesso!")
+        return True
+    except Exception as e:
+        print(f"Erro ao enviar para a planilha: {e}")
+        return False
+    
+# --- FUNÇÃO DE CALCULAR E MOSTRAR SALDO DE CATEGORIA ---
+def calcular_e_mostrar_saldo(chat_id, categoria, bot):
+    try:
+        URL_DA_PLANILHA_DE_ORCAMENTO = "https://docs.google.com/spreadsheets/d/1PCGI-zQUSxJvKODT90URQy9v-i5_t9PPzqJb7PF8j2k/edit?gid=1411223296#gid=1411223296"
+
+        meses_em_portugues = {
+            1: "Janeiro", 2: "Fevereiro", 3: "Março", 4: "Abril", 5: "Maio", 6: "Junho",
+            7: "Julho", 8: "Agosto", 9: "Setembro", 10: "Outubro", 11: "Novembro", 12: "Dezembro"
+        }
+
+        hoje = datetime.now()
+        mes_do_gasto = hoje.month
+        mes_atual_str = str(hoje.month)
+
+        mes_do_orcamento = mes_do_gasto + 1 if mes_do_gasto < 12 else 1
+        nome_da_aba_orcamento = meses_em_portugues[mes_do_orcamento]
+
+        planilha_orcamento = CLIENT.open_by_url(URL_DA_PLANILHA_DE_ORCAMENTO)
+        orcamento_sheet = planilha_orcamento.worksheet(nome_da_aba_orcamento)
+
+        cell = orcamento_sheet.find(categoria, in_column=7)
+        if not cell:
+            bot.send_message(chat_id,f"Atenção: Não encontrei um orçamento para '{categoria}' na planilha de orçamento (aba: '{nome_da_aba_orcamento}').")
+            return
+        
+        valor_orcamento_str = orcamento_sheet.cell(cell.row, cell.col + 1).value
+        valor_orcamento = float(valor_orcamento_str.replace("R$", '').replace('.', '').replace(',', '.'))
+
+        lancamentos_sheet = SHEET 
+        list_of_lists = lancamentos_sheet.get_all_values()
+        
+        headers = list_of_lists[0]
+        data_rows = list_of_lists[1:]
+        todos_lancamentos = []
+        for row in data_rows:
+            record = dict(zip(headers, row))
+            todos_lancamentos.append(record)
+        # --------------------------------
+
+        gastos_do_mes = 0
+        for lancamento in todos_lancamentos:
+            # Checa se as chaves existem antes de usá-las para evitar erros
+            if 'Categoria' in lancamento and 'Mês' in lancamento:
+                if lancamento['Categoria'] == categoria and str(lancamento['Mês']) == mes_atual_str:
+                    valor_gasto_str = str(lancamento.get('Valor', '0')) # .get() para mais segurança
+                    valor_gasto_limpo = valor_gasto_str.replace('R$ ', '').replace('.', '').replace(',', '.')
+                    if valor_gasto_limpo: # Garante que não é uma string vazia
+                      gastos_do_mes += float(valor_gasto_limpo)
+        
+        saldo_restante = valor_orcamento - gastos_do_mes
+        mensagem_saldo = (
+            f"-----------------------------\n"
+            f"Saldo restante para **`{categoria}`** (Orçamento de {nome_da_aba_orcamento}):\n"
+            f"Orçamento: R$ {valor_orcamento:,.2f}\n"
+            f"Total Gasto no Mês: R$ {gastos_do_mes:,.2f}\n"
+            f"**Disponível: R$ {saldo_restante:,.2f}**"
+        ).replace(',', 'X').replace('.', ',').replace('X', '.')
+
+        bot.send_message(chat_id, mensagem_saldo, parse_mode='Markdown')
+
+    except gspread.exceptions.WorksheetNotFound:
+        bot.send_message(chat_id, f"Não consegui encontrar a aba de orçamento '{nome_da_aba_orcamento}' na sua planilha. Você já a criou?")
+    except Exception as e:
+        print(f"Ocorreu um erro INESPERADO ao calcular o saldo. Veja o raio-x do erro abaixo:")
+        bot.send_message(chat_id, "Não consegui calcular o saldo restante. Encontrei um erro inesperado, verifique o console.")
+
+# --- FLUXO DO BOT ---
+
+@bot.message_handler(commands=['lancargasto'])
+def lancar_gasto(mensagem):
+    texto = "Maravilha, em qual das categorias abaixo se encaixa esse gasto?"
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    botoes = []
+    for categoria in CATEGORIAS:
+        texto_botao = categoria.replace('_', ' ').capitalize()
+        botoes.append(types.InlineKeyboardButton(texto_botao, callback_data = categoria))
+    markup.add(*botoes)
+    bot.send_message(mensagem.chat.id, texto, reply_markup=markup)
+
+def processar_valor(mensagem):
+    chat_id = mensagem.chat.id
+    try:
+        valor = float(mensagem.text.replace(',', '.'))
+        gasto_atual[chat_id]['Valor'] = valor
+        msg = bot.send_message(chat_id, "Valor registrado. Qual a data do gasto? (dd/mm/aaaa ou 'hoje')")
+        bot.register_next_step_handler(msg, processar_data)
+    except ValueError:
+        msg = bot.send_message(chat_id, "Valor inválido. Por favor, envie apenas o número (ex: 25.99).")
+        bot.register_next_step_handler(msg, processar_valor)
+
+def processar_data(mensagem):
+    chat_id = mensagem.chat.id
+    data_texto = mensagem.text.lower()
+    
+    if data_texto == 'hoje':
+        data_gasto = datetime.now().strftime('%d/%m/%Y')
+    else:
+        try:
+            datetime.strptime(data_texto, '%d/%m/%Y')
+            data_gasto = data_texto
+        except ValueError:
+            msg = bot.send_message(chat_id, "Formato de data inválido. Use dd/mm/aaaa ou digite 'hoje'.")
+            bot.register_next_step_handler(msg, processar_data)
+            return
+    gasto_atual[chat_id]['Data'] = data_gasto
+    msg_proximo_passo=bot.send_message(chat_id, "Data registrada. Descreva sobre o que se trata esse gasto?")
+    bot.register_next_step_handler(msg_proximo_passo, processar_descricao)
+
+def processar_descricao (mensagem):
+    chat_id = mensagem.chat.id
+    descricao = mensagem.text
+    gasto_atual[chat_id]['Descricao'] = descricao
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    cartoes = ["Amex", "Nubank", "C6 Victor", "C6 Isa", "Inter"]
+    botoes = [types.InlineKeyboardButton(cartao, callback_data=cartao) for cartao in cartoes]
+    markup.add(*botoes)
+    bot.send_message(chat_id, "Descrição anotada! Agora selecione o cartão utilizado:",reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda call: call.data in CATEGORIAS)
+def callback_categoria(callback):
+    categoria = callback.data
+    chat_id = callback.message.chat.id
+
+    texto_feedback = f"Categoria selecionada: {categoria.replace('_', ' ').capitalize()}"
+    bot.edit_message_text(texto_feedback, chat_id, callback.message.message_id)
+
+    gasto_atual[chat_id] = {'Categoria': categoria}
+    msg = bot.send_message(chat_id, f"Ok, qual o valor do gasto?")
+    bot.register_next_step_handler(msg, processar_valor)
+
+@bot.callback_query_handler(func=lambda call: True)
+def callback_cartao(callback):
+    chat_id = callback.message.chat.id
+    cartao_selecionado = callback.data
+    gasto_atual[chat_id]['Cartão'] = cartao_selecionado
+    dados_finais = gasto_atual.pop(chat_id)
+    
+    bot.edit_message_text(f"Cartão selecionado: {cartao_selecionado}", chat_id, callback.message.message_id)
+    
+    if enviar_para_planilha(dados_finais):
+        confirmacao = f"""
+        Gasto registrado com sucesso!
+        -----------------------------
+        Categoria: {dados_finais['Categoria']}
+        Valor: R$ {dados_finais['Valor']:.2f}
+        Data: {dados_finais['Data']}
+        Descrição: {dados_finais['Descricao']}
+        Cartão: {dados_finais['Cartão']}
+        """
+        bot.send_message(chat_id, confirmacao)
+        calcular_e_mostrar_saldo(chat_id, dados_finais['Categoria'], bot)
+    # CHAMANDO A FUNÇÃO GLOBAL
+    else:
+        bot.send_message(chat_id, confirmacao, "Ops! Houve um problema ao salvar na planilha. Verifique o console do programa.")
+        
+
+# --- Funções Adicionais e de Ajuda ---
+
+@bot.message_handler(commands=["s2"])
+def s2(mensagem):
+    bot.reply_to(mensagem, "Eu também te amo muito meu amor ❤️")
+
+@bot.message_handler(func=lambda message: True)
+def responder_padrao(mensagem):
+    texto = """
+Olá! Vamos atualizar a vida financeira?
+Selecione uma opção para continuarmos:
+
+/lancargasto -> Lançar um novo gasto
+/s2 -> Mandar um eu te amo
+
+Qualquer outra coisa não irá funcionar.
+CLIQUE em uma das opções.
+    """
+    bot.reply_to(mensagem, texto)
+
+print("Bot iniciado...")
+bot.polling()
